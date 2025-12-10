@@ -35,7 +35,7 @@
 Clone the repository and install dependencies:
 
 ```bash
-git clone https://github.com/YourUsername/TAG-CLIP.git
+git clone https://github.com/Flame-Chasers/TAG-PR.git
 cd TAG-CLIP
 pip install -r requirements.txt
 ```
