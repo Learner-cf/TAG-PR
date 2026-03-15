@@ -60,9 +60,11 @@ class CLIP(nn.Module):
         text_features_norm = F.normalize(text_features)
         image_features_norm_gathered = self.all_gather(image_features_norm)
         text_features_norm_gathered = self.all_gather(text_features_norm)
-        ret['view_loss'] = losses.get('view_loss', 0)
+        view_ratio = getattr(self.config.experiment, 'view_ratio', 1.0)
+        ortho_ratio = getattr(self.config.experiment, 'ortho_ratio', 1.0)
+        ret['view_loss'] = losses.get('view_loss', 0) * view_ratio
         ret['view_acc'] = losses.get('view_acc', 0)
-        ret['ortho_loss'] = losses.get('ortho_loss', 0)
+        ret['ortho_loss'] = losses.get('ortho_loss', 0) * ortho_ratio
 
         logit_scale = self.logit_scale.exp()
         logit_scale.data = torch.clamp(logit_scale.data, max=100)
