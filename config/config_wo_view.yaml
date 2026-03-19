@@ -1,0 +1,73 @@
+device: 0
+
+misc:
+  seed: 0
+
+experiment:
+  input_resolution: [224, 224]
+  dropout: 0.05
+  text_length: 77
+
+  l1_only: false
+  nitc_ratio: 1.0
+  ritc_eps: 1.0e-2
+
+  id: true
+  id_ratio: 0.5
+
+loss:
+  use_ga_on_m_text: true
+  use_id_on_m_img: true
+  use_view_loss: false
+  use_orth_loss: true
+  use_cons_loss: true
+  use_img_text_consistency: true
+
+  lambda_view: 0.0
+  lambda_orth: 0.1
+  lambda_cons: 0.5
+  lambda_img_text_consistency: 1.0
+
+schedule:
+  lr: 1.0e-4
+  epoch: 10
+  epoch_warmup: 1
+  lr_start: 1.0e-6
+  lr_end: 5.0e-6
+  weight_decay: 0.02
+  betas: [0.9, 0.98]
+  eps: 1.0e-8
+  ratio_factor: 1.0
+
+model:
+  ckpt_type: original_clip
+  resume: false
+  saved_path: 'ckpts/wo_view'
+  checkpoint: '/home/u2024218474/jupyterlab/TAG-PR/ViT-B-16.pt'
+
+  use_gather: true
+
+  use_trvd: true
+  use_residual_decomposer: true
+  use_shared_img_head: true
+  use_view_classifier: true
+
+  softlabel_ratio: 0.5
+  embed_dim: 512
+  vocab_size: 49408
+
+log:
+  print_period: 50
+
+data:
+  batch_size: 320
+  test_batch_size: 256
+  num_workers: 5
+
+distributed:
+  enabled: false
+  backend: nccl
+  url: 'env://'
+
+anno_dir: "/home/u2024218474/jupyterlab/TAG-PR/dataset/anno_dir"
+image_dir: "/home/u2024218474/jupyterlab/TAG-PR/dataset/images"

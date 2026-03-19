@@ -2,22 +2,30 @@ import os
 import random
 import time
 from pathlib import Path
-
+import argparse
 import torch
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
 from misc.utils import get_rank
 from misc.build import load_checkpoint, cosine_scheduler, build_optimizer
 from misc.data import build_pedes_data
 from misc.eval import test_tse, test
 from misc.utils import parse_config, init_distributed_mode, set_seed, is_master, is_using_distributed, \
     AverageMeter
-from model.tbps_model_MoE import clip_vitb
+from model.tbps_model import clip_vitb
 from options import get_args
 # from eva_clip import create_model_and_transforms
 from text_utils.logger import setup_logger
 def run(config):
-    logger = setup_logger('TAG', distributed_rank=get_rank())
+    logger = setup_logger('TAG', distributed_rank=get_rank(), save_dir=config.model.saved_path)
     logger.propagate = False
     logger.info(f'\n{config}')
+    if config.experiment.l1_only:
+        print("Running STRICT L1 baseline (no RITC)")
+    if getattr(config.model, "use_trvd", False):
+        print("Running TRVD model")
     # data
     dataloader = build_pedes_data(config)
     train_loader = dataloader['train_loader']
@@ -26,14 +34,21 @@ def run(config):
 
     meters = {
         "loss": AverageMeter(),
+        "ga_loss": AverageMeter(),
+        "la_loss": AverageMeter(),
         "itc_loss": AverageMeter(),
         "itc_tse_loss": AverageMeter(),
-        "view_loss": AverageMeter(),
-        "view_acc": AverageMeter(),
         "sdm_loss": AverageMeter(),
-        "ortho_loss": AverageMeter(),
-        "ritc_loss": AverageMeter(),
-        "ritc_tse_loss": AverageMeter(),
+        "view_loss": AverageMeter(),
+        "orth_loss": AverageMeter(),
+        "cons_loss": AverageMeter(),
+        "bridge_loss": AverageMeter(),
+        "view_acc": AverageMeter(),
+        "alpha": AverageMeter(),
+        "m_text_norm_mean": AverageMeter(),
+        "m_img_norm_mean": AverageMeter(),
+        "v_norm_mean": AverageMeter(),
+        "total_loss": AverageMeter(),
         "balance_loss": AverageMeter(),
         "router_z_loss": AverageMeter(),
         "id_loss": AverageMeter(),
@@ -47,7 +62,7 @@ def run(config):
     # model, _, preprocess = create_model_and_transforms(config, model_name, pretrained, force_custom_clip=True)
     model = clip_vitb(config, num_classes)
     model.to(config.device)
-    model, load_result = load_checkpoint(model, config)
+    model, load_result, ckpt = load_checkpoint(model, config)
 
     if is_using_distributed():
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[config.device],
@@ -62,8 +77,29 @@ def run(config):
 
     # train
     it = 0
+    start_epoch = 0
     scaler = torch.cuda.amp.GradScaler()
-    for epoch in range(config.schedule.epoch):
+
+    if ckpt is not None and getattr(config.model, "resume", False):
+        loaded_opt = False
+        if 'optimizer' in ckpt:
+            try:
+                optimizer.load_state_dict(ckpt['optimizer'])
+                loaded_opt = True
+            except ValueError:
+                logger.warning("Optimizer state incompatible with current model; skipping optimizer resume.")
+        if loaded_opt and 'scaler' in ckpt:
+            try:
+                scaler.load_state_dict(ckpt['scaler'])
+            except Exception:
+                logger.warning("Scaler state incompatible; skipping scaler resume.")
+        if loaded_opt and 'epoch' in ckpt:
+            start_epoch = int(ckpt['epoch']) + 1
+        if loaded_opt and 'it' in ckpt:
+            it = int(ckpt['it'])
+        elif loaded_opt:
+            it = start_epoch * config.schedule.niter_per_ep
+    for epoch in range(start_epoch, config.schedule.epoch):
         if is_using_distributed():
             dataloader['train_sampler'].set_epoch(epoch)
 
@@ -72,7 +108,10 @@ def run(config):
             meter.reset()
         model.train()
 
-        for i, batch in enumerate(train_loader):
+        loader_iter = train_loader
+        if tqdm is not None:
+            loader_iter = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config.schedule.epoch}", leave=False)
+        for i, batch in enumerate(loader_iter):
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr_schedule[it] * param_group['ratio']
 
@@ -83,21 +122,41 @@ def run(config):
 
             with torch.autocast(device_type='cuda'):
                 ret = model(batch, alpha, training=True)
-                loss = sum([v for k, v in ret.items() if "loss" in k])
+                if getattr(config.model, "use_trvd", False):
+                    loss = ret.get('total_loss', 0)
+                elif getattr(config.experiment, "l1_only", False):
+                    # Baseline L1 loss: L_GA + L_LA + lambda_id * L_id
+                    loss = ret.get('itc_loss', 0)
+                    if 'id_loss' in ret:
+                        loss = loss + ret.get('id_loss', 0)
+                else:
+                    loss = sum([v for k, v in ret.items() if "loss" in k])
+
+            def _mval(x):
+                if torch.is_tensor(x):
+                    return x.detach().item()
+                return x
 
             batch_size = batch['image'].shape[0]
             meters['loss'].update(loss.item(), batch_size)
-            meters['itc_loss'].update(ret.get('itc_loss', 0), batch_size)
-            meters['itc_tse_loss'].update(ret.get('itc_tse_loss', 0), batch_size)
-            meters['sdm_loss'].update(ret.get('sdm_loss', 0), batch_size)
-            meters['view_loss'].update(ret.get('view_loss', 0), batch_size)
-            meters['ortho_loss'].update(ret.get('ortho_loss', 0), batch_size)
-            meters['view_acc'].update(ret.get('view_acc', 0), batch_size)
-            meters['ritc_loss'].update(ret.get('ritc_loss', 0), batch_size)
-            meters['ritc_tse_loss'].update(ret.get('ritc_tse_loss', 0), batch_size)
-            meters['balance_loss'].update(ret.get('balance_loss', 0), batch_size)
-            meters['router_z_loss'].update(ret.get('router_z_loss', 0), batch_size)
-            meters['id_loss'].update(ret.get('id_loss', 0), batch_size)
+            meters['total_loss'].update(_mval(ret.get('total_loss', 0)), batch_size)
+            meters['ga_loss'].update(_mval(ret.get('ga_loss', 0)), batch_size)
+            meters['la_loss'].update(_mval(ret.get('la_loss', 0)), batch_size)
+            meters['itc_loss'].update(_mval(ret.get('itc_loss', 0)), batch_size)
+            meters['itc_tse_loss'].update(_mval(ret.get('itc_tse_loss', 0)), batch_size)
+            meters['sdm_loss'].update(_mval(ret.get('sdm_loss', 0)), batch_size)
+            meters['view_loss'].update(_mval(ret.get('view_loss', 0)), batch_size)
+            meters['orth_loss'].update(_mval(ret.get('orth_loss', 0)), batch_size)
+            meters['cons_loss'].update(_mval(ret.get('cons_loss', 0)), batch_size)
+            meters['bridge_loss'].update(_mval(ret.get('bridge_loss', 0)), batch_size)
+            meters['view_acc'].update(_mval(ret.get('view_acc', 0)), batch_size)
+            meters['alpha'].update(_mval(ret.get('alpha', 0)), batch_size)
+            meters['m_text_norm_mean'].update(_mval(ret.get('m_text_norm_mean', 0)), batch_size)
+            meters['m_img_norm_mean'].update(_mval(ret.get('m_img_norm_mean', 0)), batch_size)
+            meters['v_norm_mean'].update(_mval(ret.get('v_norm_mean', 0)), batch_size)
+            meters['balance_loss'].update(_mval(ret.get('balance_loss', 0)), batch_size)
+            meters['router_z_loss'].update(_mval(ret.get('router_z_loss', 0)), batch_size)
+            meters['id_loss'].update(_mval(ret.get('id_loss', 0)), batch_size)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -120,7 +179,8 @@ def run(config):
             time_per_batch = (end_time - start_time) / (i + 1)
             logger.info("Epoch {} done. Time per batch: {:.3f}[s] Speed: {:.1f}[samples/s]".format(epoch + 1, time_per_batch, train_loader.batch_size / time_per_batch))
 
-            eval_result = test_tse(model.module, dataloader['test_loader'], 77, config.device)
+            eval_model = model.module if hasattr(model, "module") else model
+            eval_result = test_tse(eval_model, dataloader['test_loader'], 77, config.device)
             rank_1, rank_5, rank_10, map = eval_result['r1'], eval_result['r5'], eval_result['r10'], eval_result['mAP']
             logger.info('Acc@1 {top1:.5f} Acc@5 {top5:.5f} Acc@10 {top10:.5f} mAP {mAP:.5f}'.format(
                 top1=rank_1, top5=rank_5, top10=rank_10, mAP=map
@@ -131,9 +191,12 @@ def run(config):
                 best_epoch = epoch
 
                 save_obj = {
-                    'model': model.module.state_dict(),
+                    'model': eval_model.state_dict(),
                     'optimizer': optimizer.state_dict(),
+                    'scaler': scaler.state_dict(),
                     'config': config,
+                    'epoch': epoch,
+                    'it': it,
                 }
                 torch.save(save_obj, os.path.join(config.model.saved_path, 'checkpoint_best.pth'))
 
@@ -148,14 +211,23 @@ def count_parameters(model):
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--config',
+        type=str,
+        default='config/config.yaml',
+        help='Path to yaml config file'
+    )
+    args = parser.parse_args()
 
-    config_path = 'config/config.yaml'
-    config = parse_config(config_path)
+    config = parse_config(args.config)
 
     Path(config.model.saved_path).mkdir(parents=True, exist_ok=True)
 
-    init_distributed_mode(config)
+    if config.experiment.l1_only:
+        config.experiment.ritc = False
 
+    init_distributed_mode(config)
     set_seed(config)
 
     run(config)

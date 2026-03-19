@@ -36,6 +36,7 @@ def interpolate_text(pos_embed_checkpoint, target_dim=77):
 
 
 def load_checkpoint(model, config):
+    ckpt = None
     # Load original CLIP checkpoint 
     if config.model.ckpt_type == 'original_clip':
         with open(config.model.checkpoint, 'rb') as opened_file:
@@ -61,28 +62,8 @@ def load_checkpoint(model, config):
             else:
                 new_state[name] = params
         
-        # Handle MoE expansion
-        num_of_experts = config.num_of_experts
-        expert_blocks = config.expert_blocks
-        
-        if expert_blocks:
-            moe_state_dict = {}
-            for key, value in new_state.items():
-                target_block = next((i for i in expert_blocks if key.startswith(f'visual.transformer.resblocks.{i}.mlp')), None)
-                
-                if target_block is not None:
-                    # Duplicate weights for each expert
-                    for j in range(num_of_experts):
-                        # Replace path: ...resblocks.10.mlp... -> ...resblocks.10.experts.0...
-                        new_key = key.replace(f'visual.transformer.resblocks.{target_block}.mlp', 
-                                            f'visual.transformer.resblocks.{target_block}.experts.{j}')
-                        moe_state_dict[new_key] = value.clone()
-                else:
-                    moe_state_dict[key] = value
-            new_state = moe_state_dict
     # Load saved checkpoint
     elif config.model.ckpt_type == 'saved':
-        # Assume the saved checkpoint already contains the expert structure, so no expansion is needed
         ckpt = torch.load(os.path.join(config.model.saved_path, 'checkpoint_best.pth'), map_location='cpu')
         new_state = ckpt['model']
         
@@ -95,7 +76,7 @@ def load_checkpoint(model, config):
     # Print loading results for verification
     # print(f"Model loaded from {config.model.ckpt_type}. Missing keys: {load_result.missing_keys}, Unexpected: {load_result.unexpected_keys}")
 
-    return model, load_result
+    return model, load_result, ckpt
 
 
 def cosine_scheduler(config):

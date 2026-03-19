@@ -28,7 +28,6 @@ class TextTransformer(nn.Module):
             attn_mask=self.build_attention_mask(),
             checkpoint=checkpoint,
             dropout=config.experiment.dropout,
-            expert_blocks=config.expert_blocks,
         )
         self.token_embedding = nn.Embedding(49408, transformer_width)
         self.positional_embedding = nn.Parameter(

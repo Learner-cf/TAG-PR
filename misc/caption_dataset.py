@@ -47,6 +47,8 @@ class ps_train_dataset(Dataset):
         image_path, caption, cam_id, person = self.pairs[index]
         image_pil = Image.open(image_path)
         image = self.transform(image_pil.convert('RGB'))
+        cam_id = torch.tensor(cam_id, dtype=torch.long)
+        person = torch.tensor(person, dtype=torch.long)
         return {
             'image': image,
             'caption': caption,

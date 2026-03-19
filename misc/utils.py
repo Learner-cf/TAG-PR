@@ -18,8 +18,11 @@ def parse_config(config_path):
     return config
 
 
+_DIST_ENABLED = False
+
+
 def is_using_distributed():
-    return True
+    return _DIST_ENABLED
 
 
 def is_dist_avail_and_initialized():
@@ -53,13 +56,18 @@ def wandb_record():
 
 
 def init_distributed_mode(config):
-    if is_using_distributed():
+    global _DIST_ENABLED
+    dist_enabled = False
+    if hasattr(config, "distributed"):
+        dist_enabled = bool(getattr(config.distributed, "enabled", False))
+    if dist_enabled:
         config.distributed.rank = int(os.environ['RANK'])
         config.distributed.world_size = int(os.environ['WORLD_SIZE'])
         config.distributed.local_rank = int(os.environ['LOCAL_RANK'])
         torch.distributed.init_process_group(backend=config.distributed.backend,
                                              init_method=config.distributed.url)
         used_for_printing(get_rank() == 0)
+    _DIST_ENABLED = dist_enabled
 
     if torch.cuda.is_available():
         if is_using_distributed():

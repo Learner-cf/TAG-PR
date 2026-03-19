@@ -1,28 +1,43 @@
-device: 5
+device: 0
 
 misc:
   seed: 0
 
-num_of_experts_groups: 2
-num_of_experts: 6
-num_of_selected_experts: 5
-expert_blocks: [6, 7, 8]
-
 experiment:
   # image
   input_resolution: [224, 224]
+
   # text
   dropout: 0.05
   text_length: 77
-  # loss
+
+  # base loss
+  l1_only: true
   nitc_ratio: 1.0
-  ####
-  ritc: true
+
+  # kept only for parser compatibility
   ritc_eps: 1.0e-2
-  ritc_ratio: 1.0
-  ####
+
+  # ID loss
   id: true
   id_ratio: 0.5
+
+loss:
+  # shared branch selection
+  use_ga_on_m_text: true
+  use_id_on_m_img: true
+
+  # TRVD losses
+  use_view_loss: true
+  use_orth_loss: true
+  use_cons_loss: true
+  use_img_text_consistency: true
+
+  # loss weights
+  lambda_view: 1.0
+  lambda_orth: 0.1
+  lambda_cons: 0.5
+  lambda_img_text_consistency: 1.0
 
 schedule:
   lr: 1.0e-4
@@ -36,10 +51,19 @@ schedule:
   ratio_factor: 1.0
 
 model:
-  ckpt_type: original_clip  # original_clip / saved
+  ckpt_type: original_clip
+  resume: false
   saved_path: 'ckpts/'
-  checkpoint: '/path/to/clip/ViT-B-16.pt'    # e.g., '../../data/CLIP/ViT-B-16.pt'
+  checkpoint: '/home/u2024218474/jupyterlab/TAG-PR/ViT-B-16.pt'
+
   use_gather: true
+
+  # ===== TRVD full =====
+  use_trvd: true
+  use_residual_decomposer: true
+  use_shared_img_head: true
+  use_view_classifier: true
+
   softlabel_ratio: 0.5
   embed_dim: 512
   vocab_size: 49408
@@ -48,13 +72,14 @@ log:
   print_period: 50
 
 data:
-  batch_size: 80
+  batch_size: 280
   test_batch_size: 256
-  num_workers: 8
+  num_workers: 5
 
 distributed:
+  enabled: false
   backend: nccl
   url: 'env://'
 
-anno_dir: "/path/to/dataset/anno_dir"   
-image_dir: "/path/to/dataset/images"     
+anno_dir: "/home/u2024218474/jupyterlab/TAG-PR/dataset/anno_dir"
+image_dir: "/home/u2024218474/jupyterlab/TAG-PR/dataset/images"
