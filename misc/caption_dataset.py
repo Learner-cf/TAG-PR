@@ -61,6 +61,7 @@ class ps_eval_dataset(Dataset):
     def __init__(self, ann_root, image_root, transform, split, max_words=30):
         ann_file = os.path.join(ann_root, split + '_reid.json')
         anns = json.load(open(ann_file, 'r'))
+        self.ann = anns
         self.transform = transform
         self.text = []
         self.image = []
@@ -87,8 +88,14 @@ class ps_eval_dataset(Dataset):
         image_path = self.image[index]
         image = Image.open(image_path).convert('RGB')
         image = self.transform(image)
-
-        return image
+        # return cam_id if available (default 1 for compatibility)
+        ann = self.ann[index]
+        cam_id = ann.get('cam_id', 1)
+        return {
+            'image': image,
+            'cam_id': cam_id,
+            'id': ann.get('id', -1),
+        }
 
 def pre_caption(caption, max_words=50):
     caption = re.sub(

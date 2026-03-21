@@ -23,9 +23,9 @@ def run(config):
     logger.propagate = False
     logger.info(f'\n{config}')
     if config.experiment.l1_only:
-        print("Running STRICT L1 baseline (no RITC)")
-    if getattr(config.model, "use_trvd", False):
-        print("Running TRVD model")
+        print("Running STRICT L1 baseline")
+    if getattr(config.loss, "use_aerial_correction", False):
+        print("Running Single-Adapter Aerial Correction")
     # data
     dataloader = build_pedes_data(config)
     train_loader = dataloader['train_loader']
@@ -34,24 +34,12 @@ def run(config):
 
     meters = {
         "loss": AverageMeter(),
+        "total_loss": AverageMeter(),
         "ga_loss": AverageMeter(),
         "la_loss": AverageMeter(),
-        "itc_loss": AverageMeter(),
-        "itc_tse_loss": AverageMeter(),
-        "sdm_loss": AverageMeter(),
-        "view_loss": AverageMeter(),
-        "orth_loss": AverageMeter(),
-        "cons_loss": AverageMeter(),
-        "bridge_loss": AverageMeter(),
-        "view_acc": AverageMeter(),
-        "alpha": AverageMeter(),
-        "m_text_norm_mean": AverageMeter(),
-        "m_img_norm_mean": AverageMeter(),
-        "v_norm_mean": AverageMeter(),
-        "total_loss": AverageMeter(),
-        "balance_loss": AverageMeter(),
-        "router_z_loss": AverageMeter(),
         "id_loss": AverageMeter(),
+        "distill_loss": AverageMeter(),
+        "ice_loss": AverageMeter(),
     }
     best_rank_1 = 0.0
     best_epoch = 0
@@ -122,8 +110,12 @@ def run(config):
 
             with torch.autocast(device_type='cuda'):
                 ret = model(batch, alpha, training=True)
-                if getattr(config.model, "use_trvd", False):
-                    loss = ret.get('total_loss', 0)
+                if getattr(config.loss, "use_aerial_correction", False):
+                    warmup_epochs = getattr(config.loss, "warmup_epochs", 3)
+                    if epoch < warmup_epochs:
+                        loss = ret.get('ga_loss', 0) + ret.get('la_loss', 0) + ret.get('id_loss', 0)
+                    else:
+                        loss = ret.get('total_loss', 0)
                 elif getattr(config.experiment, "l1_only", False):
                     # Baseline L1 loss: L_GA + L_LA + lambda_id * L_id
                     loss = ret.get('itc_loss', 0)
@@ -139,24 +131,12 @@ def run(config):
 
             batch_size = batch['image'].shape[0]
             meters['loss'].update(loss.item(), batch_size)
-            meters['total_loss'].update(_mval(ret.get('total_loss', 0)), batch_size)
+            meters['total_loss'].update(_mval(loss), batch_size)
             meters['ga_loss'].update(_mval(ret.get('ga_loss', 0)), batch_size)
             meters['la_loss'].update(_mval(ret.get('la_loss', 0)), batch_size)
-            meters['itc_loss'].update(_mval(ret.get('itc_loss', 0)), batch_size)
-            meters['itc_tse_loss'].update(_mval(ret.get('itc_tse_loss', 0)), batch_size)
-            meters['sdm_loss'].update(_mval(ret.get('sdm_loss', 0)), batch_size)
-            meters['view_loss'].update(_mval(ret.get('view_loss', 0)), batch_size)
-            meters['orth_loss'].update(_mval(ret.get('orth_loss', 0)), batch_size)
-            meters['cons_loss'].update(_mval(ret.get('cons_loss', 0)), batch_size)
-            meters['bridge_loss'].update(_mval(ret.get('bridge_loss', 0)), batch_size)
-            meters['view_acc'].update(_mval(ret.get('view_acc', 0)), batch_size)
-            meters['alpha'].update(_mval(ret.get('alpha', 0)), batch_size)
-            meters['m_text_norm_mean'].update(_mval(ret.get('m_text_norm_mean', 0)), batch_size)
-            meters['m_img_norm_mean'].update(_mval(ret.get('m_img_norm_mean', 0)), batch_size)
-            meters['v_norm_mean'].update(_mval(ret.get('v_norm_mean', 0)), batch_size)
-            meters['balance_loss'].update(_mval(ret.get('balance_loss', 0)), batch_size)
-            meters['router_z_loss'].update(_mval(ret.get('router_z_loss', 0)), batch_size)
             meters['id_loss'].update(_mval(ret.get('id_loss', 0)), batch_size)
+            meters['distill_loss'].update(_mval(ret.get('distill_loss', 0)), batch_size)
+            meters['ice_loss'].update(_mval(ret.get('ice_loss', 0)), batch_size)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -166,13 +146,16 @@ def run(config):
             it += 1
 
             if (i + 1) % config.log.print_period == 0:
-                info_str = f"Epoch[{epoch + 1}] Iteration[{i + 1}/{len(train_loader)}]"
-                # log loss
-                for k, v in meters.items():
-                    if v.val != 0:
-                        info_str += f", {k}: {v.val:.4f}"
-                info_str += f", Base Lr: {param_group['lr']:.2e}"
-                logger.info(info_str)
+                logger.info(
+                    f"Epoch[{epoch + 1}] Iteration[{i + 1}/{len(train_loader)}], "
+                    f"total_loss: {meters['total_loss'].val:.4f}, "
+                    f"ga_loss: {meters['ga_loss'].val:.4f}, "
+                    f"la_loss: {meters['la_loss'].val:.4f}, "
+                    f"id_loss: {meters['id_loss'].val:.4f}, "
+                    f"distill_loss: {meters['distill_loss'].val:.4f}, "
+                    f"ice_loss: {meters['ice_loss'].val:.4f}, "
+                    f"Base Lr: {param_group['lr']:.2e}"
+                )
 
         if is_master():
             end_time = time.time()
@@ -223,9 +206,6 @@ if __name__ == '__main__':
     config = parse_config(args.config)
 
     Path(config.model.saved_path).mkdir(parents=True, exist_ok=True)
-
-    if config.experiment.l1_only:
-        config.experiment.ritc = False
 
     init_distributed_mode(config)
     set_seed(config)

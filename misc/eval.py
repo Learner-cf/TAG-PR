@@ -23,9 +23,15 @@ def test(model, data_loader, max_length, device):
     text_feats = torch.cat(text_feats, dim=0)
 
     image_feats = []
-    for image in data_loader:
-        image = image.to(device)
-        image_feat = F.normalize(model.encode_image(image), dim=-1)
+    for batch in data_loader:
+        if isinstance(batch, dict):
+            image = batch['image'].to(device)
+            cam_id = batch.get('cam_id', None)
+            cam_id = cam_id.to(device) if cam_id is not None else None
+            image_feat = F.normalize(model.encode_image(image, cam_id=cam_id), dim=-1)
+        else:
+            image = batch.to(device)
+            image_feat = F.normalize(model.encode_image(image), dim=-1)
         image_feats.append(image_feat)
     image_feats = torch.cat(image_feats, dim=0)
 
@@ -60,9 +66,15 @@ def test_tse(model, data_loader, max_length, device):
 
     image_feats = []
     image_tse_feats = []
-    for image in data_loader:
-        image = image.to(device)
-        image_feat, image_feat_dense, attn_i = model.encode_image(image, return_dense=True)
+    for batch in data_loader:
+        if isinstance(batch, dict):
+            image = batch['image'].to(device)
+            cam_id = batch.get('cam_id', None)
+            cam_id = cam_id.to(device) if cam_id is not None else None
+            image_feat, image_feat_dense, attn_i = model.encode_image(image, cam_id=cam_id, return_dense=True)
+        else:
+            image = batch.to(device)
+            image_feat, image_feat_dense, attn_i = model.encode_image(image, return_dense=True)
         image_feat = F.normalize(image_feat, dim=-1)
         image_feats.append(image_feat)
         image_tse_feat = F.normalize(model.visual_emb_layer(attn_i, image_feat_dense, training=False), dim=-1)
