@@ -91,6 +91,7 @@ class ps_eval_dataset(Dataset):
         # return cam_id if available (default 1 for compatibility)
         ann = self.ann[index]
         cam_id = ann.get('cam_id', 1)
+        cam_id = torch.tensor(cam_id, dtype=torch.long)
         return {
             'image': image,
             'cam_id': cam_id,

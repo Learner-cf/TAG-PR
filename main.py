@@ -15,32 +15,30 @@ from misc.eval import test_tse, test
 from misc.utils import parse_config, init_distributed_mode, set_seed, is_master, is_using_distributed, \
     AverageMeter
 from model.tbps_model import clip_vitb
-from options import get_args
 # from eva_clip import create_model_and_transforms
 from text_utils.logger import setup_logger
+
+
+def _add_meter(meters, name):
+    meters[name] = AverageMeter()
+
+
 def run(config):
     logger = setup_logger('TAG', distributed_rank=get_rank(), save_dir=config.model.saved_path)
     logger.propagate = False
     logger.info(f'\n{config}')
-    if config.experiment.l1_only:
-        print("Running STRICT L1 baseline")
-    if getattr(config.loss, "use_aerial_correction", False):
-        print("Running Single-Adapter Aerial Correction")
+    if getattr(config.model, "cg_vdfe", None) is not None and bool(getattr(config.model.cg_vdfe, "enable", False)):
+        logger.info("Running CG-VDFE + L_view training")
+    else:
+        logger.info("Running baseline (global/local alignment + id loss)")
+
     # data
     dataloader = build_pedes_data(config)
     train_loader = dataloader['train_loader']
     num_classes = len(train_loader.dataset.person2text)
     config.num_classes = num_classes
 
-    meters = {
-        "loss": AverageMeter(),
-        "total_loss": AverageMeter(),
-        "ga_loss": AverageMeter(),
-        "la_loss": AverageMeter(),
-        "id_loss": AverageMeter(),
-        "distill_loss": AverageMeter(),
-        "ice_loss": AverageMeter(),
-    }
+    meters = {}
     best_rank_1 = 0.0
     best_epoch = 0
 
@@ -110,18 +108,8 @@ def run(config):
 
             with torch.autocast(device_type='cuda'):
                 ret = model(batch, alpha, training=True)
-                if getattr(config.loss, "use_aerial_correction", False):
-                    warmup_epochs = getattr(config.loss, "warmup_epochs", 3)
-                    if epoch < warmup_epochs:
-                        loss = ret.get('ga_loss', 0) + ret.get('la_loss', 0) + ret.get('id_loss', 0)
-                    else:
-                        loss = ret.get('total_loss', 0)
-                elif getattr(config.experiment, "l1_only", False):
-                    # Baseline L1 loss: L_GA + L_LA + lambda_id * L_id
-                    loss = ret.get('itc_loss', 0)
-                    if 'id_loss' in ret:
-                        loss = loss + ret.get('id_loss', 0)
-                else:
+                loss = ret.get('total_loss', None)
+                if loss is None:
                     loss = sum([v for k, v in ret.items() if "loss" in k])
 
             def _mval(x):
@@ -130,13 +118,12 @@ def run(config):
                 return x
 
             batch_size = batch['image'].shape[0]
-            meters['loss'].update(loss.item(), batch_size)
-            meters['total_loss'].update(_mval(loss), batch_size)
-            meters['ga_loss'].update(_mval(ret.get('ga_loss', 0)), batch_size)
-            meters['la_loss'].update(_mval(ret.get('la_loss', 0)), batch_size)
-            meters['id_loss'].update(_mval(ret.get('id_loss', 0)), batch_size)
-            meters['distill_loss'].update(_mval(ret.get('distill_loss', 0)), batch_size)
-            meters['ice_loss'].update(_mval(ret.get('ice_loss', 0)), batch_size)
+            for k, v in ret.items():
+                if "loss" not in k and k not in ("gate_mean", "gate_std"):
+                    continue
+                if k not in meters:
+                    _add_meter(meters, k)
+                meters[k].update(_mval(v), batch_size)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -146,16 +133,23 @@ def run(config):
             it += 1
 
             if (i + 1) % config.log.print_period == 0:
-                logger.info(
-                    f"Epoch[{epoch + 1}] Iteration[{i + 1}/{len(train_loader)}], "
-                    f"total_loss: {meters['total_loss'].val:.4f}, "
-                    f"ga_loss: {meters['ga_loss'].val:.4f}, "
-                    f"la_loss: {meters['la_loss'].val:.4f}, "
-                    f"id_loss: {meters['id_loss'].val:.4f}, "
-                    f"distill_loss: {meters['distill_loss'].val:.4f}, "
-                    f"ice_loss: {meters['ice_loss'].val:.4f}, "
-                    f"Base Lr: {param_group['lr']:.2e}"
-                )
+                log_parts = [f"Epoch[{epoch + 1}] Iteration[{i + 1}/{len(train_loader)}]"]
+                if "total_loss" in meters and meters["total_loss"].count > 0:
+                    log_parts.append(f"total_loss: {meters['total_loss'].val:.4f}")
+                other_losses = [k for k in meters.keys() if k != "total_loss" and k not in ("gate_mean", "gate_std")]
+                for k in sorted(other_losses):
+                    if meters[k].count > 0:
+                        log_parts.append(f"{k}: {meters[k].val:.4f}")
+                if "gate_mean" in meters and meters["gate_mean"].count > 0:
+                    log_parts.append(f"gate_mean: {meters['gate_mean'].val:.4f}")
+                if "gate_std" in meters and meters["gate_std"].count > 0:
+                    log_parts.append(f"gate_std: {meters['gate_std'].val:.4f}")
+                log_parts.append(f"Base Lr: {param_group['lr']:.2e}")
+                log_msg = ", ".join(log_parts)
+                if tqdm is not None:
+                    tqdm.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} TAG INFO: {log_msg}")
+                else:
+                    logger.info(log_msg)
 
         if is_master():
             end_time = time.time()

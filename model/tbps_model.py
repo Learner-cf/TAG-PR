@@ -9,6 +9,7 @@ from .visual_transformer import visual_transformer
 from .text_transformer import text_transformers
 from .shared_modules import AllGather
 from .CrossEmbeddingLayer_tse import VisualEmbeddingLayer, TexualEmbeddingLayer
+from .caption_guided_vdfe import CaptionGuidedAGViewDecoupler
 
 
 class CLIP(nn.Module):
@@ -24,176 +25,224 @@ class CLIP(nn.Module):
         self.config = config
         self.eps = eps
 
+        model_cfg = getattr(config, "model", None)
+        loss_cfg = getattr(config, "loss", None)
+        baseline_cfg = getattr(model_cfg, "baseline", None) if model_cfg is not None else None
+        weights_cfg = getattr(loss_cfg, "weights", None) if loss_cfg is not None else None
+
+        self.use_global_align = bool(getattr(baseline_cfg, "global_align", True)) if baseline_cfg is not None else True
+        self.use_local_align = bool(getattr(baseline_cfg, "local_align", True)) if baseline_cfg is not None else True
+        self.use_id_loss = bool(getattr(baseline_cfg, "id_loss", True)) if baseline_cfg is not None else True
+
+        self.lambda_global = float(getattr(weights_cfg, "global_align", 1.0)) if weights_cfg is not None else 1.0
+        self.lambda_local = float(getattr(weights_cfg, "local_align", 1.0)) if weights_cfg is not None else 1.0
+        self.lambda_id = float(getattr(weights_cfg, "id", 0.5)) if weights_cfg is not None else 0.5
+
+        self.use_ag_decoupling = bool(getattr(model_cfg, "use_ag_decoupling", False)) if model_cfg is not None else False
+        self.lambda_rm = float(getattr(weights_cfg, "lambda_rm", 0.2)) if weights_cfg is not None else 0.2
+        self.lambda_l1 = float(getattr(weights_cfg, "lambda_l1", 0.1)) if weights_cfg is not None else 0.1
+        self.lambda_ag = float(getattr(weights_cfg, "lambda_ag", 0.5)) if weights_cfg is not None else 0.5
+        self.lambda_v = float(getattr(weights_cfg, "lambda_v", 1.0)) if weights_cfg is not None else 1.0
+        self.lambda_inv = float(getattr(weights_cfg, "lambda_inv", 1.0)) if weights_cfg is not None else 1.0
+        self.lambda_o = float(getattr(weights_cfg, "lambda_o", 0.1)) if weights_cfg is not None else 0.1
+        self.ag_num_classes = int(getattr(model_cfg, "ag_num_classes", 2)) if model_cfg is not None else 2
+        self.ag_dropout = float(getattr(model_cfg, "ag_dropout", 0.0)) if model_cfg is not None else 0.0
+
+        if self.use_ag_decoupling:
+            self.ag_decoupler = CaptionGuidedAGViewDecoupler(
+                embed_dim=self.embed_dim,
+                num_heads=int(getattr(model_cfg, "ag_heads", 8)) if model_cfg is not None else 8,
+                dropout=self.ag_dropout,
+                lambda_rm=self.lambda_rm,
+            )
+            self.ag_classifier = nn.Linear(self.embed_dim, self.ag_num_classes)
+            nn.init.normal_(self.ag_classifier.weight.data, std=0.001)
+            nn.init.constant_(self.ag_classifier.bias.data, val=0.0)
+        else:
+            self.ag_decoupler = None
+            self.ag_classifier = None
+
         self.visual_emb_layer = VisualEmbeddingLayer(ratio=0.3)
         self.textual_emb_layer = TexualEmbeddingLayer(ratio=0.3)
 
-        # Aerial correction mode
-        loss_cfg = getattr(config, "loss", None)
-        self.use_aerial_correction = bool(getattr(loss_cfg, "use_aerial_correction", False)) if loss_cfg is not None else False
-        if self.use_aerial_correction:
-            self.gate_teacher = nn.Sequential(
-                nn.Linear(self.embed_dim * 2, self.embed_dim),
-                nn.ReLU(inplace=True),
-                nn.Linear(self.embed_dim, self.embed_dim),
-                nn.Sigmoid(),
-            )
-            self.gate_student = nn.Sequential(
-                nn.Linear(self.embed_dim, self.embed_dim),
-                nn.ReLU(inplace=True),
-                nn.Linear(self.embed_dim, self.embed_dim),
-                nn.Sigmoid(),
-            )
-            self.view_proj = nn.Sequential(
-                nn.Linear(self.embed_dim, self.embed_dim),
-                nn.ReLU(inplace=True),
-                nn.Linear(self.embed_dim, self.embed_dim),
-            )
-
-        if config.experiment.id:
+        if self.use_id_loss:
             self.classifier = nn.Linear(self.embed_dim, num_classes)
             nn.init.normal_(self.classifier.weight.data, std=0.001)
             nn.init.constant_(self.classifier.bias.data, val=0.0)
+        else:
+            self.classifier = None
+
 
     def forward(self, input, alpha, training=False):
         ret = dict()
 
         images = input['image'].to(self.config.device)
-        texts = input['caption']
-        cam_id = input['cam_id'].to(self.config.device)
-        text_tokens = tokenize(texts, context_length=self.config.experiment.text_length).to(self.config.device)
-        ids = input['id'].to(self.config.device)
+        texts = input.get('caption', None)
+        ids = input.get('id', None)
+        ids = ids.to(self.config.device) if ids is not None else None
 
-        image_features, image_seq_embeddings, feaAttn_i = self.encode_image(
-            images, cam_id=cam_id, return_dense=True, training=training
+        text_tokens = None
+        if texts is not None:
+            text_tokens = tokenize(texts, context_length=self.config.experiment.text_length).to(self.config.device)
+
+        image_features, image_seq_embeddings, feaAttn_i = self._encode_image_backbone(
+            images, return_dense=True, training=training
         )
-        text_features, text_seq_embeddings, feaAttn_t = self.encode_text(
-            text_tokens, return_dense=True, training=training
-        )
+        text_features, text_seq_embeddings, feaAttn_t = (None, None, None)
+        if text_tokens is not None:
+            text_features, text_seq_embeddings, feaAttn_t = self.encode_text(
+                text_tokens, return_dense=True, training=training
+            )
 
-        # ----- Aerial correction (train/infer) -----
-        corrected_image_features = image_features
-        a2t_loss = torch.zeros((), device=image_features.device)
-        tre_loss = torch.zeros((), device=image_features.device)
-        ice_loss = torch.zeros((), device=image_features.device)
-        distill_loss = torch.zeros((), device=image_features.device)
-        a2g_loss = torch.zeros((), device=image_features.device)
-        shift_loss = torch.zeros((), device=image_features.device)
-        reg_loss = torch.zeros((), device=image_features.device)
-        shift_acc_fa = 0.0
-        shift_acc_fg = 0.0
+        f_cls_raw = image_features
+        f_cls = f_cls_raw
+        f_id = None
+        f_view = None
+        f_hat = None
 
-        if self.use_aerial_correction:
-            aerial_mask = cam_id == 0
-            ground_mask = cam_id == 1
+        ga_loss = torch.zeros((), device=f_cls.device)
+        la_loss = torch.zeros((), device=f_cls.device)
+        ln_itc = torch.zeros((), device=f_cls.device)
+        lr_itc = torch.zeros((), device=f_cls.device)
+        ln_itc_tse = torch.zeros((), device=f_cls.device)
+        lr_itc_tse = torch.zeros((), device=f_cls.device)
+        sim_targets = None
+        logit_scale = None
 
-            if aerial_mask.any():
-                f_a = image_features[aerial_mask]
-                f_t_a = text_features[aerial_mask]
+        if text_features is not None and ids is not None:
+            idx = ids.view(-1, 1)
+            gathered_ids = self.all_gather(ids)
+            idx_all = gathered_ids.view(1, -1)
+            pos_idx = torch.eq(idx, idx_all).float()
+            sim_targets = pos_idx / pos_idx.sum(1, keepdim=True)
 
-                # view residual
-                v_a = self.view_proj(f_a)
-                # student gate (always)
-                g_student = self.gate_student(f_a)
-                # teacher gate (train only)
-                if training:
-                    ft_cat = torch.cat([f_a, f_t_a], dim=-1)
-                    g_teacher = self.gate_teacher(ft_cat)
-                    distill_loss = F.mse_loss(g_student, g_teacher.detach())
-                # refined feature
-                delta_a = g_student * v_a
-                h_a = F.normalize(f_a - 0.1 * delta_a, dim=-1)
+            logit_scale = self.logit_scale.exp()
+            logit_scale.data = torch.clamp(logit_scale.data, max=100)
 
-                # replace aerial rows in corrected features
-                corrected_image_features = image_features.clone()
-                corrected_image_features[aerial_mask] = h_a.to(corrected_image_features.dtype)
+        if self.use_global_align and text_features is not None and sim_targets is not None and logit_scale is not None:
+            image_features_norm = F.normalize(f_cls)
+            text_features_norm = F.normalize(text_features)
+            image_features_norm_gathered = self.all_gather(image_features_norm)
+            text_features_norm_gathered = self.all_gather(text_features_norm)
 
-                # ICE: identity consistency enhancement
-                ice_loss = (1 - F.cosine_similarity(h_a, f_a, dim=-1)).mean()
+            image_features_s_norm = image_features_norm.detach()
+            text_features_s_norm = text_features_norm.detach()
+            image_features_s_norm_gathered = image_features_norm_gathered.detach()
+            text_features_s_norm_gathered = text_features_norm_gathered.detach()
 
-                # a2g_loss is invalid for this dataset (no shared IDs across views)
-                a2g_loss = torch.zeros((), device=image_features.device)
+            ga_loss, ln_itc, lr_itc = self.calc_contrastive(
+                image_features_norm, text_features_norm, image_features_s_norm,
+                text_features_s_norm, image_features_norm_gathered,
+                text_features_norm_gathered, image_features_s_norm_gathered,
+                text_features_s_norm_gathered, sim_targets, alpha, logit_scale
+            )
+            ret['ga_loss'] = ga_loss * self.config.experiment.nitc_ratio
+            ret['ln_itc'] = ln_itc
+            ret['lr_itc'] = lr_itc
 
-        # ----- Global alignment (corrected image features) -----
-        image_features_norm = F.normalize(corrected_image_features)
-        text_features_norm = F.normalize(text_features)
-        image_features_norm_gathered = self.all_gather(image_features_norm)
-        text_features_norm_gathered = self.all_gather(text_features_norm)
-        logit_scale = self.logit_scale.exp()
-        logit_scale.data = torch.clamp(logit_scale.data, max=100)
+        i_tse_f = None
+        t_tse_f = None
+        if self.use_local_align and feaAttn_i is not None and feaAttn_t is not None and sim_targets is not None and logit_scale is not None:
+            i_tse_f = F.normalize(self.visual_emb_layer(feaAttn_i, image_seq_embeddings), dim=-1)
+            t_tse_f = F.normalize(self.textual_emb_layer(feaAttn_t, text_tokens, text_seq_embeddings), dim=-1)
+            i_tse_f_norm_gathered = self.all_gather(i_tse_f)
+            t_tse_f_norm_gathered = self.all_gather(t_tse_f)
+            i_tse_f_s_gathered = i_tse_f_norm_gathered.detach()
+            t_tse_f_s_gathered = t_tse_f_norm_gathered.detach()
+            la_loss, ln_itc_tse, lr_itc_tse = self.calc_contrastive(
+                i_tse_f, t_tse_f, i_tse_f.detach(), t_tse_f.detach(),
+                i_tse_f_norm_gathered, t_tse_f_norm_gathered,
+                i_tse_f_s_gathered, t_tse_f_s_gathered, sim_targets, alpha, logit_scale
+            )
+            ret['la_loss'] = la_loss * self.config.experiment.nitc_ratio
+            ret['ln_itc_tse'] = ln_itc_tse
+            ret['lr_itc_tse'] = lr_itc_tse
 
-        idx = ids.view(-1, 1)
-        gathered_ids = self.all_gather(ids)
-        idx_all = gathered_ids.view(1, -1)
-        pos_idx = torch.eq(idx, idx_all).float()
-        sim_targets = pos_idx / pos_idx.sum(1, keepdim=True)
-
-        image_features_s_norm = image_features_norm.detach()
-        text_features_s_norm = text_features_norm.detach()
-        image_features_s_norm_gathered = image_features_norm_gathered.detach()
-        text_features_s_norm_gathered = text_features_norm_gathered.detach()
-
-        ga_loss, ln_itc, lr_itc = self.calc_contrastive(
-            image_features_norm, text_features_norm, image_features_s_norm,
-            text_features_s_norm, image_features_norm_gathered,
-            text_features_norm_gathered, image_features_s_norm_gathered,
-            text_features_s_norm_gathered, sim_targets, alpha, logit_scale
-        )
-
-        # ----- Local alignment (unchanged) -----
-        i_tse_f = F.normalize(self.visual_emb_layer(feaAttn_i, image_seq_embeddings), dim=-1)
-        t_tse_f = F.normalize(self.textual_emb_layer(feaAttn_t, text_tokens, text_seq_embeddings), dim=-1)
-        i_tse_f_norm_gathered = self.all_gather(i_tse_f)
-        t_tse_f_norm_gathered = self.all_gather(t_tse_f)
-        i_tse_f_s_gathered = i_tse_f_norm_gathered.detach()
-        t_tse_f_s_gathered = t_tse_f_norm_gathered.detach()
-        la_loss, ln_itc_tse, lr_itc_tse = self.calc_contrastive(
-            i_tse_f, t_tse_f, i_tse_f.detach(), t_tse_f.detach(),
-            i_tse_f_norm_gathered, t_tse_f_norm_gathered,
-            i_tse_f_s_gathered, t_tse_f_s_gathered, sim_targets, alpha, logit_scale
-        )
-
-        ret['ga_loss'] = ga_loss * self.config.experiment.nitc_ratio
-        ret['la_loss'] = la_loss * self.config.experiment.nitc_ratio
-        ret['itc_tse_loss'] = ret['la_loss']
-        ret['itc_loss'] = ret['ga_loss'] + ret['la_loss']
-        ret['ln_itc'] = ln_itc
-        ret['lr_itc'] = lr_itc
-        ret['ln_itc_tse'] = ln_itc_tse
-        ret['lr_itc_tse'] = lr_itc_tse
-
-        # ----- ID loss (corrected image features) -----
-        if self.config.experiment.id:
-            image_logits = self.classifier(corrected_image_features)
+        id_loss = torch.zeros((), device=f_cls.device)
+        image_logits = None
+        text_logits = None
+        if self.use_id_loss and self.classifier is not None and text_features is not None and ids is not None:
+            image_logits = self.classifier(f_cls)
             text_logits = self.classifier(text_features)
             id_loss = (F.cross_entropy(image_logits, ids) + F.cross_entropy(text_logits, ids)) / 2
-            ret['id_loss'] = id_loss * self.config.experiment.id_ratio
-        else:
-            ret['id_loss'] = torch.zeros((), device=image_features.device)
+            ret['id_loss'] = id_loss
 
-        # ----- Aerial correction losses -----
-        ret['ice_loss'] = ice_loss
-        ret['distill_loss'] = distill_loss
+        if image_logits is not None:
+            ret['id_logits'] = image_logits
+        if text_logits is not None:
+            ret['text_logits'] = text_logits
 
-        # ----- Total loss -----
-        if self.use_aerial_correction:
-            loss_cfg = getattr(self.config, "loss", None)
-            lambda_distill = getattr(loss_cfg, "lambda_distill", 0.5) if loss_cfg is not None else 0.5
-            lambda_ice = getattr(loss_cfg, "lambda_ice", 0.05) if loss_cfg is not None else 0.05
-            total = ret['ga_loss'] + ret['la_loss'] + ret['id_loss']
-            total = total + lambda_distill * ret['distill_loss']
-            total = total + lambda_ice * ret['ice_loss']
-            ret['total_loss'] = total
-        else:
-            ret['total_loss'] = ret['itc_loss'] + ret['id_loss']
+        total = torch.zeros((), device=f_cls.device)
+        if self.use_global_align:
+            total = total + self.lambda_global * ga_loss
+        if self.use_local_align:
+            total = total + self.lambda_local * la_loss
+        if self.use_id_loss:
+            total = total + self.lambda_id * id_loss
+
+        l1_loss = torch.zeros((), device=f_cls.device)
+        ag_dec_loss = torch.zeros((), device=f_cls.device)
+        orth_loss = torch.zeros((), device=f_cls.device)
+        ag_logits_raw = None
+        ag_logits_view = None
+        ag_logits_hat = None
+        if self.use_ag_decoupling and self.ag_decoupler is not None and text_seq_embeddings is not None:
+            f_id, f_view, f_hat = self.ag_decoupler(f_cls_raw, text_seq_embeddings)
+            l1_loss = torch.mean(torch.abs(f_hat - f_id.detach()))
+
+            ag_label = None
+            for k in ("cam_id", "view", "ag_label"):
+                if k in input and input[k] is not None:
+                    ag_label = input[k]
+                    break
+            if ag_label is not None and self.ag_classifier is not None:
+                ag_label = ag_label.to(self.config.device).long()
+                ag_logits_raw = self.ag_classifier(f_cls_raw)
+                ag_logits_view = self.ag_classifier(f_view)
+                ag_logits_hat = self.ag_classifier(f_hat)
+
+                loss_raw = F.cross_entropy(ag_logits_raw, ag_label)
+                log_p_hat = F.log_softmax(ag_logits_hat, dim=-1)
+                uniform = torch.full_like(log_p_hat, 1.0 / log_p_hat.size(1))
+                loss_inv = -(uniform * log_p_hat).sum(dim=1).mean()
+
+                orth_loss = torch.abs(F.cosine_similarity(f_id, f_view, dim=-1)).mean() * 100
+                ag_dec_loss = loss_raw + self.lambda_inv * loss_inv
+
+                ret['ag_logits_raw'] = ag_logits_raw
+                ret['ag_logits_view'] = ag_logits_view
+                ret['ag_logits_hat'] = ag_logits_hat
+            else:
+                orth_loss = torch.abs(F.cosine_similarity(f_id, f_view, dim=-1)).mean() * 100
+                ag_dec_loss = torch.zeros((), device=f_cls.device)
+
+            total = total + self.lambda_l1 * l1_loss + self.lambda_ag * ag_dec_loss + self.lambda_o * orth_loss
+
+        ret['l1_loss'] = l1_loss
+        ret['ag_dec_loss'] = ag_dec_loss
+        ret['orth_loss'] = orth_loss
+        if f_id is not None:
+            ret['f_id'] = f_id
+        if f_view is not None:
+            ret['f_view'] = f_view
+        if f_hat is not None:
+            ret['f_hat'] = f_hat
+
+        ret['total_loss'] = total
+        ret['f_cls'] = f_cls
+        if text_features is not None:
+            ret['t_eos'] = text_features
+        if i_tse_f is not None:
+            ret['local_img_feat'] = i_tse_f
+        if t_tse_f is not None:
+            ret['local_txt_feat'] = t_tse_f
 
         return ret
 
-    # input features are normed
     def calc_contrastive(self, image_features, text_features, image_features_s, text_features_s,
                          image_features_gathered, text_features_gathered, image_features_s_gathered,
                          text_features_s_gathered,
                          sim_targets, alpha, logit_scale):
-        # LN-ITC + LR-ITC (symmetric; no standalone RITC)
         sim_i2t = logit_scale * image_features @ text_features_gathered.t()
         sim_t2i = logit_scale * text_features @ image_features_gathered.t()
         bsz = sim_i2t.size(0)
@@ -236,40 +285,24 @@ class CLIP(nn.Module):
 
     def encode_image(self, image, cam_id=None, training=False, return_dense=False):
         if return_dense:
-            output = self.visual(image.type(self.dtype), cam_id=cam_id, training=training, return_dense=return_dense)
-            if isinstance(output, (tuple, list)):
-                img_feat, dense_feat, attn = output
-            else:
-                img_feat, dense_feat, attn = output, None, None
-            if self.use_aerial_correction and not training and cam_id is not None:
-                corrected = img_feat
-                aerial_mask = cam_id == 0
-                if aerial_mask.any():
-                    f_a = img_feat[aerial_mask]
-                    v_a = self.view_proj(f_a)
-                    g_student = self.gate_student(f_a)
-                    m_a = f_a - g_student * v_a
-                    h_a = F.normalize(f_a + 0.1 * m_a, dim=-1)
-                    corrected = img_feat.clone()
-                    corrected[aerial_mask] = h_a
-                return corrected, dense_feat, attn
-            return output
+            return self.visual(image.type(self.dtype), return_dense=return_dense, training=training)
         output = self.visual(image.type(self.dtype), training=training)
         if isinstance(output, (tuple, list)):
             output = output[0]
-        if self.use_aerial_correction and not training and cam_id is not None:
-            corrected = output
-            aerial_mask = cam_id == 0
-            if aerial_mask.any():
-                f_a = output[aerial_mask]
-                v_a = self.view_proj(f_a)
-                g_student = self.gate_student(f_a)
-                m_a = f_a - g_student * v_a
-                h_a = F.normalize(f_a + 0.1 * m_a, dim=-1)
-                corrected = output.clone()
-                corrected[aerial_mask] = h_a
-            return corrected
         return output
+
+    def _encode_image_backbone(self, image, cam_id=None, training=False, return_dense=False):
+        if return_dense:
+            output = self.visual(image.type(self.dtype), cam_id=cam_id, training=training, return_dense=return_dense)
+            if isinstance(output, (tuple, list)):
+                f_cls, dense_feat, attn = output
+            else:
+                f_cls, dense_feat, attn = output, None, None
+            return f_cls, dense_feat, attn
+        output = self.visual(image.type(self.dtype), training=training)
+        if isinstance(output, (tuple, list)):
+            output = output[0]
+        return output, None, None
 
     def all_gather(self, input):
         if not self.use_gather or not is_using_distributed():

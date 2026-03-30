@@ -60,12 +60,10 @@ class VisualTransformer(nn.Module):
 
     def forward(self, x: torch.Tensor, cam_id=None, return_dense=False, return_feature=False, training=False):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
-        # shape = [*, width, grid ** 2]
         x = x.reshape(x.shape[0], x.shape[1], -1)
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
         x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)
         x = x + self.positional_embedding.to(x.dtype)
-
 
         x = self.ln_pre(x)
 
@@ -74,11 +72,11 @@ class VisualTransformer(nn.Module):
         x = x.permute(1, 0, 2)  # LND -> NLD
 
         x = self.ln_post(x)
-        x_wo_view = x
-        dense_feat = x_wo_view
+        x_wo_cls = x
+        dense_feat = x_wo_cls
 
         if self.proj is not None:
-            dense_feat = x_wo_view @ self.proj
+            dense_feat = x_wo_cls @ self.proj
             x = dense_feat[:, 0, :]
 
         if return_dense:
