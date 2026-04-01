@@ -15,11 +15,8 @@ loss:
     global_align: 1.0
     local_align: 1.0
     id: 0.5
-    lambda_rm: 0.2
-    lambda_l1: 0.1
-    lambda_ag: 0.5
-    lambda_inv: 1.0
-    lambda_o: 0.1
+    view: 1.0
+    dec: 0.1
 
 schedule:
   lr: 1.0e-4
@@ -42,10 +39,13 @@ model:
   softlabel_ratio: 0.5
   embed_dim: 512
   vocab_size: 49408
-  use_ag_decoupling: true
-  ag_num_classes: 2
-  ag_dropout: 0.0
-  ag_heads: 8
+  use_cap_view_decoupling: true
+  use_view_loss: true
+  use_dec_loss: true
+  cap_heads: 8
+  view_heads: 8
+  alpha_inv: 0.2
+  beta_sp: 0.2
 
   baseline:
     global_align: true

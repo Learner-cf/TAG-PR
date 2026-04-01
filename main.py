@@ -27,10 +27,7 @@ def run(config):
     logger = setup_logger('TAG', distributed_rank=get_rank(), save_dir=config.model.saved_path)
     logger.propagate = False
     logger.info(f'\n{config}')
-    if getattr(config.model, "cg_vdfe", None) is not None and bool(getattr(config.model.cg_vdfe, "enable", False)):
-        logger.info("Running CG-VDFE + L_view training")
-    else:
-        logger.info("Running baseline (global/local alignment + id loss)")
+    logger.info("Running baseline (global/local alignment + id loss)")
 
     # data
     dataloader = build_pedes_data(config)
@@ -95,8 +92,6 @@ def run(config):
         model.train()
 
         loader_iter = train_loader
-        if tqdm is not None:
-            loader_iter = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config.schedule.epoch}", leave=False)
         for i, batch in enumerate(loader_iter):
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr_schedule[it] * param_group['ratio']
@@ -119,7 +114,7 @@ def run(config):
 
             batch_size = batch['image'].shape[0]
             for k, v in ret.items():
-                if "loss" not in k and k not in ("gate_mean", "gate_std"):
+                if "loss" not in k and not k.endswith("_acc"):
                     continue
                 if k not in meters:
                     _add_meter(meters, k)
@@ -136,20 +131,13 @@ def run(config):
                 log_parts = [f"Epoch[{epoch + 1}] Iteration[{i + 1}/{len(train_loader)}]"]
                 if "total_loss" in meters and meters["total_loss"].count > 0:
                     log_parts.append(f"total_loss: {meters['total_loss'].val:.4f}")
-                other_losses = [k for k in meters.keys() if k != "total_loss" and k not in ("gate_mean", "gate_std")]
+                other_losses = [k for k in meters.keys() if k != "total_loss"]
                 for k in sorted(other_losses):
                     if meters[k].count > 0:
                         log_parts.append(f"{k}: {meters[k].val:.4f}")
-                if "gate_mean" in meters and meters["gate_mean"].count > 0:
-                    log_parts.append(f"gate_mean: {meters['gate_mean'].val:.4f}")
-                if "gate_std" in meters and meters["gate_std"].count > 0:
-                    log_parts.append(f"gate_std: {meters['gate_std'].val:.4f}")
                 log_parts.append(f"Base Lr: {param_group['lr']:.2e}")
                 log_msg = ", ".join(log_parts)
-                if tqdm is not None:
-                    tqdm.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} TAG INFO: {log_msg}")
-                else:
-                    logger.info(log_msg)
+                logger.info(log_msg)
 
         if is_master():
             end_time = time.time()
