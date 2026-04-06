@@ -102,7 +102,7 @@ def run(config):
                 alpha = config.model.softlabel_ratio
 
             with torch.autocast(device_type='cuda'):
-                ret = model(batch, alpha, training=True)
+                ret = model(batch, alpha, training=True, epoch=epoch)
                 loss = ret.get('total_loss', None)
                 if loss is None:
                     loss = sum([v for k, v in ret.items() if "loss" in k])
@@ -131,10 +131,33 @@ def run(config):
                 log_parts = [f"Epoch[{epoch + 1}] Iteration[{i + 1}/{len(train_loader)}]"]
                 if "total_loss" in meters and meters["total_loss"].count > 0:
                     log_parts.append(f"total_loss: {meters['total_loss'].val:.4f}")
-                other_losses = [k for k in meters.keys() if k != "total_loss"]
+                other_losses = [k for k in meters.keys() if k != "total_loss" and k not in {"view_cls_loss", "view_conf_loss", "view_acc_cls", "view_acc_fid", "view_probe_loss"}]
                 for k in sorted(other_losses):
                     if meters[k].count > 0:
                         log_parts.append(f"{k}: {meters[k].val:.4f}")
+
+                def _get_metric(name, default=-1.0):
+                    v = ret.get(name, None)
+                    if v is None:
+                        return default
+                    return v.detach().item() if torch.is_tensor(v) else float(v)
+
+                view_acc_cls = _get_metric('view_probe_acc_on_fcls')
+                view_acc_fid = _get_metric('view_probe_acc_on_fid')
+                view_probe_loss = _get_metric('view_probe_loss')
+                view_cls_loss = _get_metric('view_cls_loss')
+                view_conf_loss = _get_metric('view_conf_loss')
+                if view_cls_loss != -1.0:
+                    log_parts.append(f"view_cls_loss: {view_cls_loss:.4f}")
+                if view_conf_loss != -1.0:
+                    log_parts.append(f"view_conf_loss: {view_conf_loss:.4f}")
+                if view_acc_cls != -1.0:
+                    log_parts.append(f"view_acc_cls: {view_acc_cls:.4f}")
+                if view_acc_fid != -1.0:
+                    log_parts.append(f"view_acc_fid: {view_acc_fid:.4f}")
+                if view_probe_loss != -1.0:
+                    log_parts.append(f"view_probe_loss: {view_probe_loss:.4f}")
+
                 log_parts.append(f"Base Lr: {param_group['lr']:.2e}")
                 log_msg = ", ".join(log_parts)
                 logger.info(log_msg)

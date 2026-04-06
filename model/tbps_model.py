@@ -44,11 +44,19 @@ class CLIP(nn.Module):
         self.beta_sp = float(getattr(model_cfg, "beta_sp", 1.0)) if model_cfg is not None else 1.0
 
         self.lambda_view = float(getattr(weights_cfg, "view", 1.0)) if weights_cfg is not None else 1.0
+        self.lambda_conf = float(getattr(weights_cfg, "conf", 1.0)) if weights_cfg is not None else 1.0
         self.lambda_dec = float(getattr(weights_cfg, "dec", 1.0)) if weights_cfg is not None else 1.0
+        self.lambda_dist = float(getattr(weights_cfg, "dist", 1.0)) if weights_cfg is not None else 1.0
+        self.lambda_vis = float(getattr(weights_cfg, "vis", 1.0)) if weights_cfg is not None else 1.0
 
         self.use_cap_view_decoupling = bool(getattr(model_cfg, "use_cap_view_decoupling", True)) if model_cfg is not None else True
         self.use_view_loss = bool(getattr(model_cfg, "use_view_loss", True)) if model_cfg is not None else True
+        self.use_view_confusion = bool(getattr(model_cfg, "use_view_confusion", True)) if model_cfg is not None else True
+        self.use_detach_for_view_probe = bool(getattr(model_cfg, "use_detach_for_view_probe", True)) if model_cfg is not None else True
         self.use_dec_loss = bool(getattr(model_cfg, "use_dec_loss", True)) if model_cfg is not None else True
+        self.use_vis_alignment = bool(getattr(model_cfg, "use_vis_alignment", False)) if model_cfg is not None else False
+        self.residual_distill_start_epoch = int(getattr(model_cfg, "residual_distill_start_epoch", 3)) if model_cfg is not None else 3
+        self.residual_distill_ramp_length = int(getattr(model_cfg, "residual_distill_ramp_length", 4)) if model_cfg is not None else 4
 
 
         # modules for caption-guided branch
@@ -69,6 +77,11 @@ class CLIP(nn.Module):
         self.view_classifier = nn.Linear(self.embed_dim, 2)
         nn.init.normal_(self.view_classifier.weight.data, std=0.001)
         nn.init.constant_(self.view_classifier.bias.data, val=0.0)
+        self.residual_proj = nn.Sequential(
+            nn.Linear(self.embed_dim, self.embed_dim),
+            nn.GELU(),
+            nn.Linear(self.embed_dim, self.embed_dim),
+        )
 
         self.visual_emb_layer = VisualEmbeddingLayer(ratio=0.3)
         self.textual_emb_layer = TexualEmbeddingLayer(ratio=0.3)
@@ -150,7 +163,20 @@ class CLIP(nn.Module):
         dec_loss = (cos_sim - 0.001).clamp(min=0.0).mean() * 100.0
         return dec_loss, dec_loss
 
-    def forward(self, input, alpha, training=False):
+    def compute_residual_distillation_loss(self, student_residual, teacher_residual):
+        if student_residual is None or teacher_residual is None:
+            ref = student_residual if student_residual is not None else teacher_residual
+            return torch.zeros((), device=ref.device, dtype=ref.dtype)
+        if student_residual.size(0) <= 1:
+            return torch.zeros((), device=student_residual.device)
+        student = F.normalize(student_residual, dim=-1)
+        teacher = F.normalize(teacher_residual, dim=-1).detach()
+        loss = 1.0 - F.cosine_similarity(student, teacher, dim=-1).mean()
+        if not torch.isfinite(loss):
+            return torch.zeros((), device=student_residual.device, dtype=student_residual.dtype)
+        return loss
+
+    def forward(self, input, alpha=None, training=False, epoch=None):
         ret = dict()
 
         images = input['image'].to(self.config.device)
@@ -180,6 +206,9 @@ class CLIP(nn.Module):
             visual_cls_from_tokens, patch_tokens = self._split_visual_tokens(visual_tokens)
 
         f_cls = image_features if image_features is not None else visual_cls_from_tokens
+        r_student = self.residual_proj(f_cls)
+        f_test_raw = f_cls + r_student
+        f_test = F.normalize(f_test_raw, dim=-1)
 
         # prepare dense tokens
         # F_sem_v: token-level semantic visual representation [B, M, D]
@@ -284,28 +313,73 @@ class CLIP(nn.Module):
             total = total + self.lambda_id * id_loss
 
         # new losses
-        view_loss = torch.zeros((), device=f_cls.device)
+        view_cls_loss = torch.zeros((), device=f_cls.device)
+        view_conf_loss = torch.zeros((), device=f_cls.device)
+        residual_dist_loss = torch.zeros((), device=f_cls.device)
+        vis_ga_loss = torch.zeros((), device=f_cls.device)
         dec_loss = torch.zeros((), device=f_cls.device)
         dec_inv_sp = torch.zeros((), device=f_cls.device)
 
         view_labels = input.get('cam_id', None)
-        if self.use_cap_view_decoupling and self.use_view_loss and view_labels is not None and f_sp_proj is not None:
+        if self.use_cap_view_decoupling and self.use_view_loss and view_labels is not None:
             # expected binary labels: 0=aerial, 1=ground
             view_labels = view_labels.to(f_cls.device).long()
-            view_logits = self.view_classifier(f_sp_proj)
-            view_loss = F.cross_entropy(view_logits, view_labels)
-            view_pred = view_logits.argmax(dim=1)
-            view_acc = (view_pred == view_labels).float().mean()
-            ret['view_acc'] = view_acc
-            ret['view_logits'] = view_logits
+            view_probe_input = f_cls.detach() if self.use_detach_for_view_probe else f_cls
+            view_logits_cls = self.view_classifier(view_probe_input)
+            view_cls_loss = F.cross_entropy(view_logits_cls, view_labels)
+            view_pred_cls = view_logits_cls.argmax(dim=1)
+            view_acc_cls = (view_pred_cls == view_labels).float().mean()
+            ret['view_probe_acc_on_fcls'] = view_acc_cls
+            ret['view_logits_cls'] = view_logits_cls
+
+            if self.use_view_confusion and f_id is not None:
+                # classifier is frozen in confusion branch to ensure probe-style evaluation
+                view_logits_fid = F.linear(
+                    f_id,
+                    self.view_classifier.weight.detach(),
+                    self.view_classifier.bias.detach() if self.view_classifier.bias is not None else None
+                )
+                # margin-based probe confusion: enforce CE(f_id) >= margin (~random)
+                view_probe_loss = F.cross_entropy(view_logits_fid, view_labels)
+                margin = 0.69
+                view_conf_loss = torch.clamp(margin - view_probe_loss, min=0.0)
+                view_pred_fid = view_logits_fid.argmax(dim=1)
+                view_acc_fid = (view_pred_fid == view_labels).float().mean()
+                ret['view_probe_acc_on_fid'] = view_acc_fid
+                ret['view_logits_fid'] = view_logits_fid
+                ret['view_conf_loss'] = view_conf_loss
 
         if self.use_cap_view_decoupling and self.use_dec_loss and f_inv is not None and f_sp_proj is not None:
             dec_inv_sp, dec_loss = self.compute_decoupling_loss(f_inv, f_sp_proj)
 
-        total = total + self.lambda_view * view_loss + self.lambda_dec * dec_loss
+        if self.use_cap_view_decoupling and f_inv is not None and f_sp_proj is not None and epoch is not None and epoch >= self.residual_distill_start_epoch:
+            r_teacher = (f_id_raw - f_cls).detach()
+            raw_residual_dist = self.compute_residual_distillation_loss(r_student, r_teacher)
+            ramp_len = max(1, int(self.residual_distill_ramp_length))
+            progress = float(epoch - self.residual_distill_start_epoch + 1) / float(ramp_len)
+            progress = min(progress, 1.0)
+            residual_dist_loss = raw_residual_dist * progress
+            if not torch.isfinite(residual_dist_loss):
+                residual_dist_loss = torch.zeros_like(residual_dist_loss)
+
+        if self.use_vis_alignment and text_features is not None and sim_targets is not None and logit_scale is not None:
+            f_test_norm = F.normalize(f_test, dim=-1)
+            text_features_norm = F.normalize(text_features, dim=-1)
+            f_test_norm_gathered = self.all_gather(f_test_norm)
+            text_features_norm_gathered = self.all_gather(text_features_norm)
+            vis_ga_loss, _, _ = self.calc_contrastive(
+                f_test_norm, text_features_norm,
+                f_test_norm_gathered, text_features_norm_gathered,
+                sim_targets, logit_scale
+            )
+
+        total = total + self.lambda_view * view_cls_loss + self.lambda_conf * view_conf_loss + self.lambda_dec * dec_loss
+        total = total + self.lambda_dist * residual_dist_loss + self.lambda_vis * vis_ga_loss
 
         ret['total_loss'] = total
         ret['f_cls'] = f_cls
+        ret['r_student'] = r_student
+        ret['f_test'] = f_test
         if text_features is not None:
             ret['t_eos'] = text_features
         if i_tse_f is not None:
@@ -325,7 +399,11 @@ class CLIP(nn.Module):
             ret['f_sp_proj'] = f_sp_proj
         if F_sem_v is not None:
             ret['F_sem_v'] = F_sem_v
-        ret['view_loss'] = view_loss
+        ret['view_cls_loss'] = view_cls_loss
+        ret['view_conf_loss'] = view_conf_loss
+        ret['residual_dist_loss'] = residual_dist_loss
+        if self.use_vis_alignment:
+            ret['vis_ga_loss'] = vis_ga_loss
         ret['dec_inv_sp'] = dec_inv_sp
         ret['dec_loss'] = dec_loss
 
@@ -376,11 +454,21 @@ class CLIP(nn.Module):
 
     def encode_image(self, image, cam_id=None, training=False, return_dense=False):
         if return_dense:
-            return self.visual(image.type(self.dtype), return_dense=return_dense, training=training)
+            # use distilled visual feature for both normal and dense test to ensure train-test consistency
+            output = self.visual(image.type(self.dtype), return_dense=True, training=training)
+            if isinstance(output, (tuple, list)):
+                f_cls, dense_feat, attn = output
+            else:
+                f_cls, dense_feat, attn = output, None, None
+            r_student = self.residual_proj(f_cls)
+            f_test = F.normalize(f_cls + r_student, dim=-1)
+            return f_test, dense_feat, attn
         output = self.visual(image.type(self.dtype), training=training)
         if isinstance(output, (tuple, list)):
             output = output[0]
-        return output
+        r_student = self.residual_proj(output)
+        f_test = F.normalize(output + r_student, dim=-1)
+        return f_test
 
     def _encode_image_backbone(self, image, cam_id=None, training=False, return_dense=False):
         if return_dense:
