@@ -15,11 +15,10 @@ loss:
     global_align: 1.0
     local_align: 1.0
     id: 0.5
-    view: 0.5
-    conf: 0.5
-    dec: 0.2
-    dist: 0.5
-    vis: 1.0
+    cls_view: 0.5
+    id_adv: 0.5
+    dec: 0.5
+    vis: 0.5
 
 schedule:
   lr: 1.0e-4
@@ -44,17 +43,14 @@ model:
   vocab_size: 49408
   use_cap_view_decoupling: true
   use_view_loss: true
-  use_view_confusion: true
-  use_detach_for_view_probe: true
   use_dec_loss: true
   use_vis_alignment: true
+  grl_lambda: 1.0
   cap_heads: 8
   view_heads: 8
-  alpha_inv: 0.4
-  beta_sp: 0.2
+  alpha_inv: 0.5
+  beta_sp: 0.5
 
-  residual_distill_start_epoch: 3
-  residual_distill_ramp_length: 4
 
   baseline:
     global_align: true

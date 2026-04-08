@@ -11,6 +11,21 @@ from .shared_modules import AllGather
 from .CrossEmbeddingLayer_tse import VisualEmbeddingLayer, TexualEmbeddingLayer
 
 
+class _GRL(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, lambd):
+        ctx.lambd = lambd
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.lambd * grad_output, None
+
+
+def grl(x, lambd):
+    return _GRL.apply(x, lambd)
+
+
 class CLIP(nn.Module):
     def __init__(self, config, image_encode, text_encode, num_classes=11003, eps=1e-2):
         super().__init__()
@@ -43,20 +58,19 @@ class CLIP(nn.Module):
         self.alpha_inv = float(getattr(model_cfg, "alpha_inv", 1.0)) if model_cfg is not None else 1.0
         self.beta_sp = float(getattr(model_cfg, "beta_sp", 1.0)) if model_cfg is not None else 1.0
 
-        self.lambda_view = float(getattr(weights_cfg, "view", 1.0)) if weights_cfg is not None else 1.0
-        self.lambda_conf = float(getattr(weights_cfg, "conf", 1.0)) if weights_cfg is not None else 1.0
+        self.lambda_cls_view = float(getattr(weights_cfg, "cls_view", 1.0)) if weights_cfg is not None else 1.0
+        self.lambda_id_adv = float(getattr(weights_cfg, "id_adv", 1.0)) if weights_cfg is not None else 1.0
         self.lambda_dec = float(getattr(weights_cfg, "dec", 1.0)) if weights_cfg is not None else 1.0
         self.lambda_dist = float(getattr(weights_cfg, "dist", 1.0)) if weights_cfg is not None else 1.0
         self.lambda_vis = float(getattr(weights_cfg, "vis", 1.0)) if weights_cfg is not None else 1.0
 
         self.use_cap_view_decoupling = bool(getattr(model_cfg, "use_cap_view_decoupling", True)) if model_cfg is not None else True
         self.use_view_loss = bool(getattr(model_cfg, "use_view_loss", True)) if model_cfg is not None else True
-        self.use_view_confusion = bool(getattr(model_cfg, "use_view_confusion", True)) if model_cfg is not None else True
-        self.use_detach_for_view_probe = bool(getattr(model_cfg, "use_detach_for_view_probe", True)) if model_cfg is not None else True
         self.use_dec_loss = bool(getattr(model_cfg, "use_dec_loss", True)) if model_cfg is not None else True
         self.use_vis_alignment = bool(getattr(model_cfg, "use_vis_alignment", False)) if model_cfg is not None else False
         self.residual_distill_start_epoch = int(getattr(model_cfg, "residual_distill_start_epoch", 3)) if model_cfg is not None else 3
         self.residual_distill_ramp_length = int(getattr(model_cfg, "residual_distill_ramp_length", 4)) if model_cfg is not None else 4
+        self.grl_lambda = float(getattr(model_cfg, "grl_lambda", 1.0)) if model_cfg is not None else 1.0
 
 
         # modules for caption-guided branch
@@ -314,7 +328,8 @@ class CLIP(nn.Module):
 
         # new losses
         view_cls_loss = torch.zeros((), device=f_cls.device)
-        view_conf_loss = torch.zeros((), device=f_cls.device)
+        view_adv_loss = torch.zeros((), device=f_cls.device)
+        view_loss = torch.zeros((), device=f_cls.device)
         residual_dist_loss = torch.zeros((), device=f_cls.device)
         vis_ga_loss = torch.zeros((), device=f_cls.device)
         dec_loss = torch.zeros((), device=f_cls.device)
@@ -324,43 +339,32 @@ class CLIP(nn.Module):
         if self.use_cap_view_decoupling and self.use_view_loss and view_labels is not None:
             # expected binary labels: 0=aerial, 1=ground
             view_labels = view_labels.to(f_cls.device).long()
-            view_probe_input = f_cls.detach() if self.use_detach_for_view_probe else f_cls
-            view_logits_cls = self.view_classifier(view_probe_input)
+            view_logits_cls = self.view_classifier(f_cls)
             view_cls_loss = F.cross_entropy(view_logits_cls, view_labels)
             view_pred_cls = view_logits_cls.argmax(dim=1)
             view_acc_cls = (view_pred_cls == view_labels).float().mean()
-            ret['view_probe_acc_on_fcls'] = view_acc_cls
+            ret['view_acc_cls'] = view_acc_cls
+            ret['view_acc_cls_acc'] = view_acc_cls
             ret['view_logits_cls'] = view_logits_cls
 
-            if self.use_view_confusion and f_id is not None:
-                # classifier is frozen in confusion branch to ensure probe-style evaluation
-                view_logits_fid = F.linear(
-                    f_id,
-                    self.view_classifier.weight.detach(),
-                    self.view_classifier.bias.detach() if self.view_classifier.bias is not None else None
-                )
-                # margin-based probe confusion: enforce CE(f_id) >= margin (~random)
-                view_probe_loss = F.cross_entropy(view_logits_fid, view_labels)
-                margin = 0.69
-                view_conf_loss = torch.clamp(margin - view_probe_loss, min=0.0)
+            if self.use_cap_view_decoupling and f_id is not None:
+                view_logits_fid = self.view_classifier(grl(f_id, self.grl_lambda))
+                view_adv_loss = F.cross_entropy(view_logits_fid, view_labels)
                 view_pred_fid = view_logits_fid.argmax(dim=1)
                 view_acc_fid = (view_pred_fid == view_labels).float().mean()
-                ret['view_probe_acc_on_fid'] = view_acc_fid
+                ret['view_acc_fid'] = view_acc_fid
+                ret['view_acc_fid_acc'] = view_acc_fid
                 ret['view_logits_fid'] = view_logits_fid
-                ret['view_conf_loss'] = view_conf_loss
+
+            view_loss = self.lambda_cls_view * view_cls_loss + self.lambda_id_adv * view_adv_loss
+            ret['view_cls_loss'] = view_cls_loss
+            ret['view_adv_loss'] = view_adv_loss
+            ret['view_loss'] = view_loss
 
         if self.use_cap_view_decoupling and self.use_dec_loss and f_inv is not None and f_sp_proj is not None:
             dec_inv_sp, dec_loss = self.compute_decoupling_loss(f_inv, f_sp_proj)
 
-        if self.use_cap_view_decoupling and f_inv is not None and f_sp_proj is not None and epoch is not None and epoch >= self.residual_distill_start_epoch:
-            r_teacher = (f_id_raw - f_cls).detach()
-            raw_residual_dist = self.compute_residual_distillation_loss(r_student, r_teacher)
-            ramp_len = max(1, int(self.residual_distill_ramp_length))
-            progress = float(epoch - self.residual_distill_start_epoch + 1) / float(ramp_len)
-            progress = min(progress, 1.0)
-            residual_dist_loss = raw_residual_dist * progress
-            if not torch.isfinite(residual_dist_loss):
-                residual_dist_loss = torch.zeros_like(residual_dist_loss)
+        # residual distillation disabled
 
         if self.use_vis_alignment and text_features is not None and sim_targets is not None and logit_scale is not None:
             f_test_norm = F.normalize(f_test, dim=-1)
@@ -373,8 +377,7 @@ class CLIP(nn.Module):
                 sim_targets, logit_scale
             )
 
-        total = total + self.lambda_view * view_cls_loss + self.lambda_conf * view_conf_loss + self.lambda_dec * dec_loss
-        total = total + self.lambda_dist * residual_dist_loss + self.lambda_vis * vis_ga_loss
+        total = total + self.lambda_dec * dec_loss + view_loss + self.lambda_vis * vis_ga_loss
 
         ret['total_loss'] = total
         ret['f_cls'] = f_cls
@@ -399,9 +402,10 @@ class CLIP(nn.Module):
             ret['f_sp_proj'] = f_sp_proj
         if F_sem_v is not None:
             ret['F_sem_v'] = F_sem_v
-        ret['view_cls_loss'] = view_cls_loss
-        ret['view_conf_loss'] = view_conf_loss
-        ret['residual_dist_loss'] = residual_dist_loss
+        if self.use_view_loss and view_labels is not None:
+            ret['view_cls_loss'] = view_cls_loss
+            ret['view_adv_loss'] = view_adv_loss
+            ret['view_loss'] = view_loss
         if self.use_vis_alignment:
             ret['vis_ga_loss'] = vis_ga_loss
         ret['dec_inv_sp'] = dec_inv_sp

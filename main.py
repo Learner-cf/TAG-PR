@@ -129,34 +129,21 @@ def run(config):
 
             if (i + 1) % config.log.print_period == 0:
                 log_parts = [f"Epoch[{epoch + 1}] Iteration[{i + 1}/{len(train_loader)}]"]
-                if "total_loss" in meters and meters["total_loss"].count > 0:
-                    log_parts.append(f"total_loss: {meters['total_loss'].val:.4f}")
-                other_losses = [k for k in meters.keys() if k != "total_loss" and k not in {"view_cls_loss", "view_conf_loss", "view_acc_cls", "view_acc_fid", "view_probe_loss"}]
-                for k in sorted(other_losses):
-                    if meters[k].count > 0:
-                        log_parts.append(f"{k}: {meters[k].val:.4f}")
 
-                def _get_metric(name, default=-1.0):
-                    v = ret.get(name, None)
-                    if v is None:
-                        return default
-                    return v.detach().item() if torch.is_tensor(v) else float(v)
+                def _append_meter(key, label=None):
+                    if key in meters and meters[key].count > 0:
+                        log_parts.append(f"{label or key}: {meters[key].val:.4f}")
 
-                view_acc_cls = _get_metric('view_probe_acc_on_fcls')
-                view_acc_fid = _get_metric('view_probe_acc_on_fid')
-                view_probe_loss = _get_metric('view_probe_loss')
-                view_cls_loss = _get_metric('view_cls_loss')
-                view_conf_loss = _get_metric('view_conf_loss')
-                if view_cls_loss != -1.0:
-                    log_parts.append(f"view_cls_loss: {view_cls_loss:.4f}")
-                if view_conf_loss != -1.0:
-                    log_parts.append(f"view_conf_loss: {view_conf_loss:.4f}")
-                if view_acc_cls != -1.0:
-                    log_parts.append(f"view_acc_cls: {view_acc_cls:.4f}")
-                if view_acc_fid != -1.0:
-                    log_parts.append(f"view_acc_fid: {view_acc_fid:.4f}")
-                if view_probe_loss != -1.0:
-                    log_parts.append(f"view_probe_loss: {view_probe_loss:.4f}")
+                _append_meter("total_loss")
+                _append_meter("ga_loss")
+                _append_meter("la_loss")
+                _append_meter("dec_loss")
+                _append_meter("vis_ga_loss")
+                _append_meter("view_loss")
+                _append_meter("view_cls_loss", "view_cls")
+                _append_meter("view_adv_loss", "view_adv")
+                _append_meter("view_acc_cls_acc", "acc_cls")
+                _append_meter("view_acc_fid_acc", "acc_id")
 
                 log_parts.append(f"Base Lr: {param_group['lr']:.2e}")
                 log_msg = ", ".join(log_parts)
