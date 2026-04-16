@@ -24,7 +24,8 @@ class VisualTransformer(nn.Module):
 
         scale = width ** -0.5
         self.class_embedding = nn.Parameter(scale * torch.randn(width))
-        self.positional_embedding = nn.Parameter(scale * torch.randn(num_patches + 1, width))
+        self.view_embedding = nn.Parameter(scale * torch.randn(width))
+        self.positional_embedding = nn.Parameter(scale * torch.randn(num_patches + 2, width))
         self.ln_pre = LayerNorm(width)
 
         self.transformer = Transformer(width, layers, heads, checkpoint=checkpoint, dropout=dropout,
@@ -59,10 +60,19 @@ class VisualTransformer(nn.Module):
         return self
 
     def forward(self, x: torch.Tensor, cam_id=None, return_dense=False, return_feature=False, training=False):
-        x = self.conv1(x)  # shape = [*, width, grid, grid]
+        x = self.conv1(x)  # shape = [B, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)
-        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
-        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)
+        x = x.permute(0, 2, 1)  # [B, num_patches, width]
+
+        cls_token = self.class_embedding.to(x.dtype) + torch.zeros(
+            x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device
+        )
+        view_token = self.view_embedding.to(x.dtype) + torch.zeros(
+            x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device
+        )
+
+        # token order: [CLS] [VIEW] [PATCHES...]
+        x = torch.cat([cls_token, view_token, x], dim=1)  # [B, num_patches + 2, width]
         x = x + self.positional_embedding.to(x.dtype)
 
         x = self.ln_pre(x)

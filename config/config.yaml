@@ -16,7 +16,7 @@ loss:
     local_align: 1.0
     id: 0.5
     cls_view: 0.5
-    id_adv: 0.5
+    id_adv: 2.0
     dec: 0.5
     vis: 0.5
 
@@ -45,10 +45,10 @@ model:
   use_view_loss: true
   use_dec_loss: true
   use_vis_alignment: true
-  grl_lambda: 1.0
+  grl_lambda: 2.0
   cap_heads: 8
   view_heads: 8
-  alpha_inv: 0.5
+  alpha_inv: 1.5
   beta_sp: 0.5
 
 

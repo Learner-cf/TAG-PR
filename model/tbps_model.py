@@ -126,16 +126,18 @@ class CLIP(nn.Module):
         out, _ = self.view_cross_attn(query=q, key=patch_tokens, value=patch_tokens)
         return out.squeeze(1)
 
-    def extract_caption_guided_feature(self, text_tokens_dense: torch.Tensor, patch_tokens: torch.Tensor):
-        # text_tokens_dense: [B, M, D], patch_tokens: [B, N, D]
-        # F_sem_v is a token-level semantic visual representation (not a single embedding)
-        if text_tokens_dense.dim() != 3 or patch_tokens.dim() != 3:
-            raise ValueError("text_tokens_dense and patch_tokens must be 3D tensors")
-        F_sem_v_attn, _ = self.cap_cross_attn(query=patch_tokens, key=text_tokens_dense, value=text_tokens_dense)
-        F_sem_v = patch_tokens + F_sem_v_attn
-        f_inv = self.inv_proj(self.attention_pool(F_sem_v))
+    def extract_caption_guided_feature(self, text_tokens_dense: torch.Tensor, cls_token: torch.Tensor):
+        # text_tokens_dense: [B, M, D], cls_token: [B, D]
+        if text_tokens_dense.dim() != 3 or cls_token.dim() != 2:
+            raise ValueError("text_tokens_dense must be [B, M, D] and cls_token must be [B, D]")
+        f_inv_attn, _ = self.cap_cross_attn(
+            query=cls_token.unsqueeze(1),
+            key=text_tokens_dense,
+            value=text_tokens_dense
+        )
+        f_inv = self.inv_proj(f_inv_attn.squeeze(1))
         f_inv = F.normalize(f_inv, dim=-1)
-        return F_sem_v, f_inv
+        return f_inv
 
     def build_final_identity_feature(self, f_cls: torch.Tensor, f_inv: torch.Tensor, f_sp: torch.Tensor):
         # f_cls: base global identity feature
@@ -154,14 +156,15 @@ class CLIP(nn.Module):
 
     def _split_visual_tokens(self, visual_tokens: torch.Tensor):
         # visual_tokens: [B, T, D]
-        if visual_tokens.size(1) >= 2:
+        if visual_tokens.size(1) >= 3:
             visual_cls_token = visual_tokens[:, 0, :]
-            visual_patch_tokens = visual_tokens[:, 1:, :]
+            visual_view_token = visual_tokens[:, 1, :]
+            visual_patch_tokens = visual_tokens[:, 2:, :]
         else:
-            # fallback: treat all tokens as patches and use mean as global token
             visual_cls_token = visual_tokens.mean(dim=1)
+            visual_view_token = visual_cls_token
             visual_patch_tokens = visual_tokens
-        return visual_cls_token, visual_patch_tokens
+        return visual_cls_token, visual_view_token, visual_patch_tokens
 
     def _split_text_tokens(self, text_tokens_dense: torch.Tensor, text_global: torch.Tensor):
         # text_tokens_dense: [B, M, D], text_global: [B, D]
@@ -214,12 +217,14 @@ class CLIP(nn.Module):
         # robust token handling
         visual_tokens = None
         visual_cls_from_tokens = None
+        visual_view_token = None
         patch_tokens = None
         if image_seq_embeddings is not None:
             visual_tokens = self._ensure_token_sequence(image_seq_embeddings, "image_seq_embeddings")
-            visual_cls_from_tokens, patch_tokens = self._split_visual_tokens(visual_tokens)
+            visual_cls_from_tokens, visual_view_token, patch_tokens = self._split_visual_tokens(visual_tokens)
 
         f_cls = image_features if image_features is not None else visual_cls_from_tokens
+        f_v = visual_view_token if visual_view_token is not None else f_cls
         r_student = self.residual_proj(f_cls)
         f_test_raw = f_cls + r_student
         f_test = F.normalize(f_test_raw, dim=-1)
@@ -242,8 +247,15 @@ class CLIP(nn.Module):
             caption_tokens_dense, caption_global_feature = self._split_text_tokens(text_tokens_dense, text_features)
 
         if self.use_cap_view_decoupling and caption_tokens_dense is not None and patch_tokens is not None:
-            F_sem_v, f_inv = self.extract_caption_guided_feature(caption_tokens_dense, patch_tokens)
-            f_sp = self.extract_view_specific_feature(patch_tokens)
+            f_inv = self.extract_caption_guided_feature(caption_tokens_dense, f_cls)
+            F_sem_v = None
+            f_tv, _ = self.cap_cross_attn(
+                query=f_v.unsqueeze(1),
+                key=caption_tokens_dense,
+                value=caption_tokens_dense
+            )
+            f_tv = f_tv.squeeze(1)
+            f_sp = f_v - f_tv
             f_sp_proj = F.normalize(self.sp_proj(f_sp), dim=-1)
             f_id_raw, f_id = self.build_final_identity_feature(f_cls, f_inv, f_sp_proj)
 
@@ -289,7 +301,14 @@ class CLIP(nn.Module):
         t_tse_f = None
         # local alignment still uses original dense visual tokens
         if self.use_local_align and feaAttn_i is not None and feaAttn_t is not None and sim_targets is not None and logit_scale is not None:
-            i_tse_f = F.normalize(self.visual_emb_layer(feaAttn_i, image_seq_embeddings), dim=-1)
+            assert patch_tokens is not None, "patch_tokens should not be None for local alignment"
+            local_visual_tokens = torch.cat([f_cls.unsqueeze(1), patch_tokens], dim=1)
+            local_attn_indices = torch.cat([
+                torch.zeros(1, device=patch_tokens.device, dtype=torch.long),
+                torch.arange(2, patch_tokens.size(1) + 2, device=patch_tokens.device, dtype=torch.long)
+            ], dim=0)
+            local_feaAttn_i = feaAttn_i.index_select(1, local_attn_indices).index_select(2, local_attn_indices)
+            i_tse_f = F.normalize(self.visual_emb_layer(local_feaAttn_i, local_visual_tokens), dim=-1)
             t_tse_f = F.normalize(self.textual_emb_layer(feaAttn_t, text_tokens, text_seq_embeddings), dim=-1)
             i_tse_f_norm_gathered = self.all_gather(i_tse_f)
             t_tse_f_norm_gathered = self.all_gather(t_tse_f)

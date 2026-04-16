@@ -11,13 +11,25 @@ def resize_pos_embed(posemb, posemb_new, hight, width):
     posemb = posemb.unsqueeze(0)
     posemb_new = posemb_new.unsqueeze(0)
 
-    posemb_token, posemb_grid = posemb[:, :1], posemb[0, 1:]
+    num_new_tokens = posemb_new.shape[1] - hight * width
+    num_old_tokens = posemb.shape[1] - int(math.sqrt(posemb.shape[1] - 1)) ** 2
+    if num_old_tokens < 1:
+        num_old_tokens = 1
 
+    posemb_token = posemb[:, :num_old_tokens]
+    posemb_grid = posemb[0, num_old_tokens:]
     gs_old = int(math.sqrt(len(posemb_grid)))
     print('Resized position embedding from size:{} to size: {} with height:{} width: {}'.format(posemb.shape, posemb_new.shape, hight, width))
     posemb_grid = posemb_grid.reshape(1, gs_old, gs_old, -1).permute(0, 3, 1, 2)
     posemb_grid = F.interpolate(posemb_grid, size=(hight, width), mode='bilinear')
     posemb_grid = posemb_grid.permute(0, 2, 3, 1).reshape(1, hight * width, -1)
+
+    if posemb_token.shape[1] < num_new_tokens:
+        extra_tokens = posemb_token[:, :1].repeat(1, num_new_tokens - posemb_token.shape[1], 1)
+        posemb_token = torch.cat([posemb_token, extra_tokens], dim=1)
+    elif posemb_token.shape[1] > num_new_tokens:
+        posemb_token = posemb_token[:, :num_new_tokens]
+
     posemb = torch.cat([posemb_token, posemb_grid], dim=1)
     return posemb.squeeze(0)
 
